@@ -15,8 +15,11 @@
 
 # %%
 import _setup  # noqa: F401
+import atexit
+import socket
 import statistics
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -27,34 +30,57 @@ import httpx
 #
 # Trong production thực tế, bạn sẽ chạy `make api` ở terminal riêng. Notebook
 # này khởi động uvicorn ở background subprocess và đợi `/healthz` trả ready.
+# Chọn cổng trống cho notebook để không xung đột với `make api` hoặc ứng dụng
+# khác trên cổng 8000. URL thực tế được in dưới đây.
 
 # %%
 ROOT = Path(_setup.__file__).resolve().parent.parent
+with socket.socket() as port_socket:
+    port_socket.bind(("127.0.0.1", 0))
+    server_port = port_socket.getsockname()[1]
 proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
+    [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
+     "--port", str(server_port), "--log-level", "warning"],
     cwd=str(ROOT),
 )
 
+
+def stop_api() -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+atexit.register(stop_api)
 # Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
-URL = "http://localhost:8000"
-for _ in range(60):
+URL = f"http://127.0.0.1:{server_port}"
+deadline = time.monotonic() + 300
+while time.monotonic() < deadline:
+    if proc.poll() is not None:
+        raise RuntimeError(f"API exited during startup (code={proc.returncode})")
     try:
-        r = httpx.get(f"{URL}/healthz", timeout=2.0)
+        r = httpx.get(f"{URL}/healthz", timeout=2.0, trust_env=False)
         if r.status_code == 200 and r.json().get("ready"):
             break
     except httpx.HTTPError:
         pass
     time.sleep(1)
 else:
-    raise RuntimeError("API didn't become ready within 60s")
+    stop_api()
+    raise RuntimeError("API didn't become ready within 300s")
 
-print(httpx.get(f"{URL}/healthz").json())
+print(f"Notebook API: {URL}")
+print(httpx.get(f"{URL}/healthz", trust_env=False).json())
 
 # %% [markdown]
 # ## 2. Single query — kiểm tra response shape
 
 # %%
-r = httpx.get(f"{URL}/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
+r = httpx.get(f"{URL}/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"}, trust_env=False)
 r.raise_for_status()
 body = r.json()
 print(f"latency_ms: {body['latency_ms']:.1f}")
@@ -88,12 +114,17 @@ def percentile(values: list[float], p: float) -> float:
 def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
     server_latencies: list[float] = []
     wall_latencies: list[float] = []
-    for _ in range(reps):
-        for q in golden:
-            t0 = time.perf_counter()
-            r = httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
-            wall_latencies.append((time.perf_counter() - t0) * 1000)
-            server_latencies.append(r.json()["latency_ms"])
+    with httpx.Client(timeout=10.0, trust_env=False) as client:
+        # Warm-up is excluded from the 100 measured calls for each mode.
+        for q in golden[:10]:
+            client.get(f"{URL}/search", params={"q": q["query"], "mode": mode}).raise_for_status()
+        for _ in range(reps):
+            for q in golden:
+                t0 = time.perf_counter()
+                r = client.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
+                wall_latencies.append((time.perf_counter() - t0) * 1000)
+                r.raise_for_status()
+                server_latencies.append(r.json()["latency_ms"])
     return {
         "p50_server": percentile(server_latencies, 0.50),
         "p95_server": percentile(server_latencies, 0.95),
@@ -127,8 +158,7 @@ else:
 # ## 5. Cleanup — stop the API server
 
 # %%
-proc.terminate()
-proc.wait(timeout=5)
+stop_api()
 print("API server stopped")
 
 # %% [markdown]

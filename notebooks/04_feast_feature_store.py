@@ -95,6 +95,13 @@ if res.stderr:
     print(res.stderr)
 assert res.returncode == 0, f"feast apply failed: {res.stderr}"
 
+views = subprocess.run(
+    ["feast", "feature-views", "list"],
+    cwd=str(FEAST_DIR), capture_output=True, text=True, check=True,
+)
+print("Registered feature views:")
+print(views.stdout)
+
 # %% [markdown]
 # ## 3. `feast materialize-incremental` — load offline → online
 #
@@ -180,12 +187,15 @@ else:
 # `get_historical_features` thực hiện Point-in-Time join: cho mỗi event row
 # `(user_id, ts)`, lấy feature value tại ts đó (không dùng giá trị tương lai).
 # Đây là cơ chế chính để tránh training-serving skew (deck §6).
+# Các timestamp truy vấn dưới đây đều sau thời điểm profile tương ứng xuất
+# hiện: u_001 tại NOW-1h, u_002 tại NOW-2h, u_003 tại NOW-3h. Truy vấn u_001
+# tại NOW-2h sẽ chưa có profile hợp lệ; không được lấy profile tương lai.
 
 # %%
 import pandas as pd
 entity_df = pd.DataFrame({
     "user_id": ["u_001", "u_002", "u_003"],
-    "event_timestamp": [NOW - timedelta(hours=2), NOW - timedelta(hours=1), NOW],
+    "event_timestamp": [NOW - timedelta(minutes=30), NOW - timedelta(hours=1), NOW],
 })
 
 historical = fs.get_historical_features(
@@ -195,6 +205,8 @@ historical = fs.get_historical_features(
         "user_profile_features:topic_affinity",
     ],
 ).to_df()
+assert len(historical) == len(entity_df), "PIT join must return all 3 query rows"
+assert historical["reading_speed_wpm"].notna().all(), "Expected historical profiles are missing"
 print(historical)
 
 # %% [markdown]
